@@ -18,10 +18,8 @@ app.get("/", (req, res) => {
 
 app.post("/webhook", async (req, res) => {
   try {
-    const action = req.body.action;
-
-    if (!action || action.type !== "updateCheckItemStateOnCard") {
-      return res.sendStatus(200);
+    console.log("Webhook hit");
+    res.sendStatus(200);
     }
 
     const cardId = action.data.card.id;
