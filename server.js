@@ -1,25 +1,11 @@
-import express from "express";
-import axios from "axios";
-
-const app = express();
-app.use(express.json());
-
-const key = "129f7d85d240ac6b419fb20531bc3e08";
-const token = "ATTA4bd8efd28a0174d4c6497d80739e9ef98dbc1063acd5dacf4dd0e90e9099852a70610460";
-
-// health check (สำคัญกับ Render)
-app.get("/healthz", (req, res) => {
-  res.send("ok");
-});
-
-app.get("/", (req, res) => {
-  res.send("Trello Webhook Running");
-});
-
 app.post("/webhook", async (req, res) => {
   try {
     console.log("Webhook hit");
-    res.sendStatus(200);
+
+    const action = req.body.action;
+
+    if (!action || action.type !== "updateCheckItemStateOnCard") {
+      return res.sendStatus(200);
     }
 
     const cardId = action.data.card.id;
@@ -28,10 +14,10 @@ app.post("/webhook", async (req, res) => {
 
     console.log("Triggered:", changed.name, changed.state);
 
-    // 🔥 กัน race condition (สำคัญมาก)
+    // 🔥 กัน race condition
     await new Promise(r => setTimeout(r, 150));
 
-    // 🔥 โหลด checklist ใหม่ล่าสุด
+    // โหลด checklist
     const { data } = await axios.get(
       `https://api.trello.com/1/cards/${cardId}/checklists`,
       { params: { key, token } }
@@ -45,36 +31,31 @@ app.post("/webhook", async (req, res) => {
     const prev = index > 0 ? items[index - 1] : null;
     const next = index < items.length - 1 ? items[index + 1] : null;
 
-    // ❌ BLOCK: ห้ามข้าม step
+    // ❌ BLOCK skip step
     if (changed.state === "complete" && prev && prev.state !== "complete") {
-
       await axios.put(
         `https://api.trello.com/1/cards/${cardId}/checkItem/${changed.id}`,
         null,
         { params: { state: "incomplete", key, token } }
       );
-
       return res.json({ blocked: "skip_step" });
     }
 
-    // ❌ BLOCK: ห้าม uncheck ถ้า step ถัดไป complete แล้ว
+    // ❌ BLOCK back step
     if (changed.state === "incomplete" && next && next.state === "complete") {
-
       await axios.put(
         `https://api.trello.com/1/cards/${cardId}/checkItem/${changed.id}`,
         null,
         { params: { state: "complete", key, token } }
       );
-
       return res.json({ blocked: "back_step" });
     }
 
-    // 🧠 ถ้ายังไม่ถึง step ที่ถูกต้อง → หยุด ไม่ move card
+    // guard
     if (prev && prev.state !== "complete") {
       return res.sendStatus(200);
     }
 
-    // 🔥 คำนวณ column
     let columnName;
 
     if (changed.state === "complete") {
@@ -87,7 +68,7 @@ app.post("/webhook", async (req, res) => {
 
     if (!columnName) return res.sendStatus(200);
 
-    // 🔥 หา list
+    // โหลด lists
     const { data: lists } = await axios.get(
       `https://api.trello.com/1/boards/${boardId}/lists`,
       { params: { key, token } }
@@ -96,7 +77,7 @@ app.post("/webhook", async (req, res) => {
     const target = lists.find(l => l.name === columnName);
     if (!target) return res.sendStatus(200);
 
-    // 🔥 ย้าย card (จะไม่ย้ายถ้าโดน block ด้านบน)
+    // move card
     await axios.put(
       `https://api.trello.com/1/cards/${cardId}`,
       null,
@@ -110,9 +91,3 @@ app.post("/webhook", async (req, res) => {
     res.sendStatus(200);
   }
 });
-
-app.listen(3000, () => {
-  console.log("Server running");
-});
-
-
