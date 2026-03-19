@@ -1,3 +1,12 @@
+import express from "express";
+import axios from "axios";
+const app = express(); app.use(express.json());
+const key = "129f7d85d240ac6b419fb20531bc3e08";
+const token = "ATTA4bd8efd28a0174d4c6497d80739e9ef98dbc1063acd5dacf4dd0e90e9099852a70610460"; 
+// health check (สำคัญกับ Render) 
+app.get("/healthz", (req, res) => { res.send("ok"); }); 
+app.get("/", (req, res) => { res.send("Trello Webhook Running"); });
+
 app.post("/webhook", async (req, res) => {
   try {
     console.log("Webhook hit");
