@@ -8,13 +8,17 @@ app.get("/healthz", (req, res) => { res.send("ok"); });
 app.get("/", (req, res) => { res.send("Trello Webhook Running"); });
 
 app.post("/webhook", async (req, res) => {
+
+  // 🔥 ตอบ 200 ทันที สำหรับ Trello verify
+  res.sendStatus(200);
+
   try {
     console.log("Webhook hit");
 
     const action = req.body.action;
 
     if (!action || action.type !== "updateCheckItemStateOnCard") {
-      return res.sendStatus(200);
+      return;
     }
 
     const cardId = action.data.card.id;
