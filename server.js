@@ -114,3 +114,5 @@ app.post("/webhook", async (req, res) => {
 app.listen(3000, () => {
   console.log("Server running");
 });
+
+console.log("Triggered:", changed.name, changed.state);
