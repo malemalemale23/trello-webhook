@@ -28,6 +28,8 @@ app.post("/webhook", async (req, res) => {
     const boardId = action.data.board.id;
     const changed = action.data.checkItem;
 
+    console.log("Triggered:", changed.name, changed.state);
+
     // 🔥 กัน race condition (สำคัญมาก)
     await new Promise(r => setTimeout(r, 150));
 
@@ -115,4 +117,4 @@ app.listen(3000, () => {
   console.log("Server running");
 });
 
-console.log("Triggered:", changed.name, changed.state);
+
