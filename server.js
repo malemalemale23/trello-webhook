@@ -5,7 +5,7 @@ const app = express();
 app.use(express.json());
 
 const key = "129f7d85d240ac6b419fb20531bc3e08";
-const token = "129f7d85d240ac6b419fb20531bc3e08";
+const token = "ATTA4bd8efd28a0174d4c6497d80739e9ef98dbc1063acd5dacf4dd0e90e9099852a70610460";
 
 // ===== cache =====
 let cachedLists = null;
