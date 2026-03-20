@@ -7,6 +7,9 @@ const token = "ATTA4bd8efd28a0174d4c6497d80739e9ef98dbc1063acd5dacf4dd0e90e90998
 app.get("/healthz", (req, res) => { res.send("ok"); }); 
 app.get("/", (req, res) => { res.send("Trello Webhook Running"); });
 app.get("/ping", (req, res) => res.send("pong"));
+app.get("/webhook", (req, res) => {
+  res.status(200).send("ok");
+});
 
 app.post("/webhook", async (req, res) => {
 
