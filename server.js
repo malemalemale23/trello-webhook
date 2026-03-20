@@ -6,12 +6,13 @@ const token = "ATTA4bd8efd28a0174d4c6497d80739e9ef98dbc1063acd5dacf4dd0e90e90998
 // health check (สำคัญกับ Render) 
 app.get("/healthz", (req, res) => { res.send("ok"); }); 
 app.get("/", (req, res) => { res.send("Trello Webhook Running"); });
+app.get("/ping", (req, res) => res.send("pong"));
 
 app.post("/webhook", async (req, res) => {
 
   // 🔥 ตอบ 200 ทันที สำหรับ Trello verify
   res.sendStatus(200);
-
+  
   try {
     console.log("Webhook hit");
 
