@@ -4,8 +4,8 @@ import axios from "axios";
 const app = express();
 app.use(express.json());
 
-const key = "YOUR_KEY";
-const token = "YOUR_TOKEN";
+const key = "129f7d85d240ac6b419fb20531bc3e08";
+const token = "129f7d85d240ac6b419fb20531bc3e08";
 
 // ===== cache =====
 let cachedLists = null;
