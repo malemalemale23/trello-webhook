@@ -4,24 +4,22 @@ import axios from "axios";
 const app = express();
 app.use(express.json());
 
-const key = "129f7d85d240ac6b419fb20531bc3e08";
-const token = "ATTA4bd8efd28a0174d4c6497d80739e9ef98dbc1063acd5dacf4dd0e90e9099852a70610460";
+const key = "YOUR_KEY";
+const token = "YOUR_TOKEN";
 
 // ===== cache =====
 let cachedLists = null;
 let lastFetch = 0;
 const CACHE_TTL = 60000;
 
-// ===== debounce ต่อ card =====
-const processing = new Map();
+// ===== debounce =====
+const lock = new Map();
 
-// ===== routes =====
-app.get("/", (_, res) => res.send("Trello Webhook Running"));
-app.get("/healthz", (_, res) => res.send("ok"));
-app.get("/webhook", (_, res) => res.status(200).send("ok"));
+app.get("/", (_, res) => res.send("OK"));
+app.get("/webhook", (_, res) => res.send("ok"));
 
 app.post("/webhook", async (req, res) => {
-  res.sendStatus(200); // 🔥 respond ทันที
+  res.sendStatus(200); // 🔥 ตอบทันที
 
   try {
     const action = req.body.action;
@@ -30,10 +28,10 @@ app.post("/webhook", async (req, res) => {
     const cardId = action.data.card.id;
     const boardId = action.data.board.id;
 
-    // ===== debounce กัน spam =====
-    if (processing.get(cardId)) return;
-    processing.set(cardId, true);
-    setTimeout(() => processing.delete(cardId), 200);
+    // ===== กัน spam =====
+    if (lock.get(cardId)) return;
+    lock.set(cardId, true);
+    setTimeout(() => lock.delete(cardId), 150);
 
     // ===== โหลด FINAL STATE =====
     const { data } = await axios.get(
@@ -44,19 +42,54 @@ app.post("/webhook", async (req, res) => {
     const items = data.flatMap(c => c.checkItems);
     if (!items.length) return;
 
-    // ===== 🔒 VALIDATE STATE =====
-    // ห้ามมี complete หลัง incomplete
+    // ===== 🔒 VALIDATE + AUTO REVERT =====
+    let invalidIndex = -1;
+
     for (let i = 1; i < items.length; i++) {
       if (items[i].state === "complete" && items[i - 1].state !== "complete") {
+        invalidIndex = i;
+        break;
+      }
+    }
 
-        // revert ตัวที่ผิด
-        await axios.put(
-          `https://api.trello.com/1/cards/${cardId}/checkItem/${items[i].id}`,
-          null,
-          { params: { state: "incomplete", key, token } }
-        );
+    // ❌ INVALID: มี complete หลัง incomplete
+    if (invalidIndex !== -1) {
 
-        return; // ❗ หยุด ไม่ move
+      // revert ทุกตัวหลังจาก break point
+      for (let i = invalidIndex; i < items.length; i++) {
+        if (items[i].state === "complete") {
+          await axios.put(
+            `https://api.trello.com/1/cards/${cardId}/checkItem/${items[i].id}`,
+            null,
+            { params: { state: "incomplete", key, token } }
+          );
+        }
+      }
+
+      return; // ❗ ไม่ move card
+    }
+
+    // ===== 🔒 BLOCK uncheck ย้อน =====
+    // เช่น 1,2,3 checked แล้ว user uncheck 1
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].state === "incomplete") {
+
+        // ถ้ามีตัวหลังเป็น complete → invalid
+        const hasNextComplete = items.slice(i + 1).some(x => x.state === "complete");
+
+        if (hasNextComplete) {
+
+          // revert ตัวนี้กลับ
+          await axios.put(
+            `https://api.trello.com/1/cards/${cardId}/checkItem/${items[i].id}`,
+            null,
+            { params: { state: "complete", key, token } }
+          );
+
+          return; // ❗ stop
+        }
+
+        break;
       }
     }
 
@@ -81,7 +114,7 @@ app.post("/webhook", async (req, res) => {
     const done = lastComplete + 1;
     const percent = Math.round((done / total) * 100);
 
-    // ===== โหลด lists (cache) =====
+    // ===== cache lists =====
     if (!cachedLists || Date.now() - lastFetch > CACHE_TTL) {
       const { data: lists } = await axios.get(
         `https://api.trello.com/1/boards/${boardId}/lists`,
@@ -94,18 +127,17 @@ app.post("/webhook", async (req, res) => {
     const target = cachedLists.find(l => l.name === columnName);
     if (!target) return;
 
-    // ===== 🔍 check current column (กัน move ซ้ำ) =====
+    // ===== กัน move ซ้ำ =====
     const currentListId = action.data.listAfter?.id;
     if (currentListId === target.id) return;
 
-    // ===== 🚀 MOVE + UPDATE TITLE =====
+    // ===== 🚀 MOVE =====
     await axios.put(
       `https://api.trello.com/1/cards/${cardId}`,
       null,
       {
         params: {
           idList: target.id,
-          name: `(${done}/${total}) ${percent}%`,
           key,
           token
         }
@@ -113,12 +145,8 @@ app.post("/webhook", async (req, res) => {
     );
 
   } catch (err) {
-    console.error("Webhook error:", err.message);
+    console.error("ERR:", err.message);
   }
 });
 
-// ===== start =====
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Server running on", PORT);
-});
+app.listen(process.env.PORT || 3000);
