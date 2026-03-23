@@ -5,7 +5,6 @@ import Redis from "ioredis";
 const app = express();
 app.use(express.json());
 
-// ===== ENV =====
 const key = process.env.TRELLO_KEY;
 const token = process.env.TRELLO_TOKEN;
 const redis = new Redis(process.env.REDIS_URL);
@@ -15,16 +14,44 @@ let cachedLists = null;
 let lastFetch = 0;
 const CACHE_TTL = 60000;
 
-// ===== utils =====
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+// ===== helpers =====
+const stateKey = (id) => `s:${id}`;
+const metaKey = (id) => `m:${id}`;
+
+// ===== SYNC ครั้งเดียว =====
+async function sync(cardId) {
+  const { data } = await axios.get(
+    `https://api.trello.com/1/cards/${cardId}/checklists`,
+    { params: { key, token } }
+  );
+
+  const items = data.flatMap(c => c.checkItems);
+
+  const ids = items.map(i => i.id);
+  const names = items.map(i => i.name);
+  const state = items.map(i => i.state === "complete" ? 1 : 0);
+
+  await redis.set(metaKey(cardId), JSON.stringify({ ids, names }), "EX", 86400);
+  await redis.set(stateKey(cardId), JSON.stringify(state), "EX", 86400);
+
+  return { ids, names, state };
+}
+
+// ===== revert =====
+async function revert(cardId, itemId, state) {
+  await axios.put(
+    `https://api.trello.com/1/cards/${cardId}/checkItem/${itemId}`,
+    null,
+    { params: { state, key, token } }
+  );
+}
 
 // ===== routes =====
 app.get("/", (_, res) => res.send("OK"));
 app.get("/webhook", (_, res) => res.send("ok"));
 
-// ===== webhook =====
 app.post("/webhook", async (req, res) => {
-  res.sendStatus(200); // 🔥 ต้องตอบทันที
+  res.sendStatus(200); // ⚡ instant
 
   try {
     const action = req.body.action;
@@ -32,100 +59,94 @@ app.post("/webhook", async (req, res) => {
 
     const cardId = action.data.card.id;
     const boardId = action.data.board.id;
+    const item = action.data.checkItem;
 
-    // ===== 🔒 LOCK กัน spam =====
-    const lockKey = `lock:${cardId}`;
-    const locked = await redis.get(lockKey);
-    if (locked) return;
+    const itemId = item.id;
+    const newState = item.state === "complete" ? 1 : 0;
 
-    await redis.set(lockKey, "1", "PX", 200); // lock 200ms
+    // ===== load cache =====
+    let rawState = await redis.get(stateKey(cardId));
+    let rawMeta = await redis.get(metaKey(cardId));
 
-    // ===== โหลด checklist (FINAL STATE) =====
-    const { data } = await axios.get(
-      `https://api.trello.com/1/cards/${cardId}/checklists`,
-      { params: { key, token } }
-    );
+    let state, ids, names;
 
-    const items = data.flatMap(c => c.checkItems);
-    if (!items.length) return;
+    if (!rawState || !rawMeta) {
+      const synced = await sync(cardId);
+      state = synced.state;
+      ids = synced.ids;
+      names = synced.names;
+    } else {
+      state = JSON.parse(rawState);
+      const meta = JSON.parse(rawMeta);
+      ids = meta.ids;
+      names = meta.names;
+    }
+
+    const index = ids.indexOf(itemId);
+    if (index === -1) return;
 
     // ===== 🧠 VALIDATE =====
 
-    // หา last checked
-    let lastChecked = -1;
-    for (let i = 0; i < items.length; i++) {
-      if (items[i].state === "complete") lastChecked = i;
+    // ❌ skip step
+    if (newState === 1 && index > 0 && state[index - 1] !== 1) {
+      await revert(cardId, itemId, "incomplete");
+      return;
     }
 
-    // ===== ❌ RULE 1: ห้าม skip =====
-    for (let i = 1; i < items.length; i++) {
-      if (items[i].state === "complete" && items[i - 1].state !== "complete") {
-        // revert ตัวนี้
-        await axios.put(
-          `https://api.trello.com/1/cards/${cardId}/checkItem/${items[i].id}`,
-          null,
-          { params: { state: "incomplete", key, token } }
-        );
+    // ❌ uncheck กลาง
+    if (newState === 0) {
+      const hasNext = state.slice(index + 1).some(v => v === 1);
+      if (hasNext) {
+        await revert(cardId, itemId, "complete");
         return;
       }
     }
 
-    // ===== ❌ RULE 2: uncheck ได้เฉพาะตัวสุดท้าย =====
-    for (let i = 0; i < items.length; i++) {
-      if (items[i].state === "incomplete") {
-        const hasCheckedAfter = items.slice(i + 1).some(x => x.state === "complete");
+    // ===== update =====
+    state[index] = newState;
 
-        if (hasCheckedAfter) {
-          // ❌ user พยายาม uncheck กลาง → revert
-          await axios.put(
-            `https://api.trello.com/1/cards/${cardId}/checkItem/${items[i].id}`,
-            null,
-            { params: { state: "complete", key, token } }
-          );
-          return;
-        }
-        break;
-      }
+    // ===== progress =====
+    let last = -1;
+    for (let i = 0; i < state.length; i++) {
+      if (state[i] === 1) last = i;
     }
 
-    // ===== 🎯 TARGET COLUMN =====
-    const columnName =
-      lastChecked === -1
-        ? items[0].name
-        : lastChecked < items.length - 1
-          ? items[lastChecked + 1].name
-          : items[lastChecked].name;
+    const isActive = last !== -1 && last < state.length - 1;
 
-    if (!columnName) return;
+    // ===== smart TTL =====
+    if (isActive) {
+      await redis.set(stateKey(cardId), JSON.stringify(state));
+    } else {
+      await redis.set(stateKey(cardId), JSON.stringify(state), "EX", 86400);
+    }
 
-    // ===== cache lists =====
+    // ===== column =====
+    const targetName =
+      last === -1
+        ? names[0]
+        : last < state.length - 1
+          ? names[last + 1]
+          : names[last];
+
+    if (!targetName) return;
+
+    // ===== lists cache =====
     if (!cachedLists || Date.now() - lastFetch > CACHE_TTL) {
-      const { data: lists } = await axios.get(
+      const { data } = await axios.get(
         `https://api.trello.com/1/boards/${boardId}/lists`,
         { params: { key, token } }
       );
-      cachedLists = lists;
+      cachedLists = data;
       lastFetch = Date.now();
     }
 
-    const target = cachedLists.find(l => l.name === columnName);
+    const target = cachedLists.find(l => l.name === targetName);
     if (!target) return;
 
-    // ===== กัน move ซ้ำ =====
-    const currentListId = action.data.listAfter?.id;
-    if (currentListId === target.id) return;
-
-    // ===== 🚀 MOVE CARD =====
     await axios.put(
       `https://api.trello.com/1/cards/${cardId}`,
       null,
-      {
-        params: {
-          idList: target.id,
-          key,
-          token
-        }
-      }
+      { params: { idList: target.id, key, token } }
     );
 
   } catch (err) {
@@ -133,7 +154,6 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// ===== start =====
 app.listen(process.env.PORT || 3000, () => {
-  console.log("Server running");
+  console.log("🚀 FINAL BOSS MODE");
 });
