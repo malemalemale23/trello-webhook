@@ -1,116 +1,139 @@
 import express from "express";
 import axios from "axios";
+import Redis from "ioredis";
 
 const app = express();
 app.use(express.json());
 
+// ===== ENV =====
 const key = process.env.TRELLO_KEY;
 const token = process.env.TRELLO_TOKEN;
+const redis = new Redis(process.env.REDIS_URL);
 
-// health check (สำคัญกับ Render)
-app.get("/healthz", (req, res) => {
-  res.send("ok");
-});
+// ===== cache lists =====
+let cachedLists = null;
+let lastFetch = 0;
+const CACHE_TTL = 60000;
 
-app.get("/", (req, res) => {
-  res.send("Trello Webhook Running");
-});
+// ===== utils =====
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// ===== routes =====
+app.get("/", (_, res) => res.send("OK"));
+app.get("/webhook", (_, res) => res.send("ok"));
+
+// ===== webhook =====
 app.post("/webhook", async (req, res) => {
+  res.sendStatus(200); // 🔥 ต้องตอบทันที
+
   try {
     const action = req.body.action;
-
-    if (!action || action.type !== "updateCheckItemStateOnCard") {
-      return res.sendStatus(200);
-    }
+    if (!action || action.type !== "updateCheckItemStateOnCard") return;
 
     const cardId = action.data.card.id;
     const boardId = action.data.board.id;
-    const changed = action.data.checkItem;
 
-    // 🔥 กัน race condition (สำคัญมาก)
-    await new Promise(r => setTimeout(r, 150));
+    // ===== 🔒 LOCK กัน spam =====
+    const lockKey = `lock:${cardId}`;
+    const locked = await redis.get(lockKey);
+    if (locked) return;
 
-    // 🔥 โหลด checklist ใหม่ล่าสุด
+    await redis.set(lockKey, "1", "PX", 200); // lock 200ms
+
+    // ===== โหลด checklist (FINAL STATE) =====
     const { data } = await axios.get(
       `https://api.trello.com/1/cards/${cardId}/checklists`,
       { params: { key, token } }
     );
 
     const items = data.flatMap(c => c.checkItems);
-    const index = items.findIndex(i => i.id === changed.id);
+    if (!items.length) return;
 
-    if (index === -1) return res.sendStatus(200);
+    // ===== 🧠 VALIDATE =====
 
-    const prev = index > 0 ? items[index - 1] : null;
-    const next = index < items.length - 1 ? items[index + 1] : null;
+    // หา last checked
+    let lastChecked = -1;
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].state === "complete") lastChecked = i;
+    }
 
-    // ❌ BLOCK: ห้ามข้าม step
-    if (changed.state === "complete" && prev && prev.state !== "complete") {
+    // ===== ❌ RULE 1: ห้าม skip =====
+    for (let i = 1; i < items.length; i++) {
+      if (items[i].state === "complete" && items[i - 1].state !== "complete") {
+        // revert ตัวนี้
+        await axios.put(
+          `https://api.trello.com/1/cards/${cardId}/checkItem/${items[i].id}`,
+          null,
+          { params: { state: "incomplete", key, token } }
+        );
+        return;
+      }
+    }
 
-      await axios.put(
-        `https://api.trello.com/1/cards/${cardId}/checkItem/${changed.id}`,
-        null,
-        { params: { state: "incomplete", key, token } }
+    // ===== ❌ RULE 2: uncheck ได้เฉพาะตัวสุดท้าย =====
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].state === "incomplete") {
+        const hasCheckedAfter = items.slice(i + 1).some(x => x.state === "complete");
+
+        if (hasCheckedAfter) {
+          // ❌ user พยายาม uncheck กลาง → revert
+          await axios.put(
+            `https://api.trello.com/1/cards/${cardId}/checkItem/${items[i].id}`,
+            null,
+            { params: { state: "complete", key, token } }
+          );
+          return;
+        }
+        break;
+      }
+    }
+
+    // ===== 🎯 TARGET COLUMN =====
+    const columnName =
+      lastChecked === -1
+        ? items[0].name
+        : lastChecked < items.length - 1
+          ? items[lastChecked + 1].name
+          : items[lastChecked].name;
+
+    if (!columnName) return;
+
+    // ===== cache lists =====
+    if (!cachedLists || Date.now() - lastFetch > CACHE_TTL) {
+      const { data: lists } = await axios.get(
+        `https://api.trello.com/1/boards/${boardId}/lists`,
+        { params: { key, token } }
       );
-
-      return res.json({ blocked: "skip_step" });
+      cachedLists = lists;
+      lastFetch = Date.now();
     }
 
-    // ❌ BLOCK: ห้าม uncheck ถ้า step ถัดไป complete แล้ว
-    if (changed.state === "incomplete" && next && next.state === "complete") {
+    const target = cachedLists.find(l => l.name === columnName);
+    if (!target) return;
 
-      await axios.put(
-        `https://api.trello.com/1/cards/${cardId}/checkItem/${changed.id}`,
-        null,
-        { params: { state: "complete", key, token } }
-      );
+    // ===== กัน move ซ้ำ =====
+    const currentListId = action.data.listAfter?.id;
+    if (currentListId === target.id) return;
 
-      return res.json({ blocked: "back_step" });
-    }
-
-    // 🧠 ถ้ายังไม่ถึง step ที่ถูกต้อง → หยุด ไม่ move card
-    if (prev && prev.state !== "complete") {
-      return res.sendStatus(200);
-    }
-
-    // 🔥 คำนวณ column
-    let columnName;
-
-    if (changed.state === "complete") {
-      columnName = next ? next.name : items[index].name;
-    }
-
-    if (changed.state === "incomplete") {
-      columnName = items[index].name;
-    }
-
-    if (!columnName) return res.sendStatus(200);
-
-    // 🔥 หา list
-    const { data: lists } = await axios.get(
-      `https://api.trello.com/1/boards/${boardId}/lists`,
-      { params: { key, token } }
-    );
-
-    const target = lists.find(l => l.name === columnName);
-    if (!target) return res.sendStatus(200);
-
-    // 🔥 ย้าย card (จะไม่ย้ายถ้าโดน block ด้านบน)
+    // ===== 🚀 MOVE CARD =====
     await axios.put(
       `https://api.trello.com/1/cards/${cardId}`,
       null,
-      { params: { idList: target.id, key, token } }
+      {
+        params: {
+          idList: target.id,
+          key,
+          token
+        }
+      }
     );
 
-    res.sendStatus(200);
-
   } catch (err) {
-    console.error(err);
-    res.sendStatus(200);
+    console.error("ERR:", err.message);
   }
 });
 
-app.listen(3000, () => {
+// ===== start =====
+app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
 });
